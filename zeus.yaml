@@ -1,0 +1,104 @@
+# ============================================================
+#  ZEUS CONFIGURATION FILE
+#  Generated automatically on first run by: zeus init
+#
+#  Zeus is a binary-protocol caching server with:
+#   - In-memory key/value cache
+#   - Optional SQLite persistence
+#   - Pub/Sub channels for realtime updates
+#   - Reliable command queues (with ACK/retry logic)
+#   - Built-in chat room system
+# ============================================================
+
+# ── Server ─────────────────────────────────────────────────
+server:
+  host: "0.0.0.0"        # Address to bind to
+  port: 7878              # TCP port Zeus listens on
+  max_connections: 1000   # Max simultaneous client connections
+  read_timeout_sec: 30    # Seconds before idle read times out
+  write_timeout_sec: 10   # Seconds before write times out
+
+# ── Security ───────────────────────────────────────────────
+security:
+  enabled: true           # Require token auth on every connection
+  token: ""               # Leave blank → Zeus auto-generates one on first run
+                          # and saves it back here. Copy it to your clients.
+  tls:
+    enabled: false        # Enable TLS (recommended in production)
+    cert_file: "zeus.crt" # Path to TLS certificate
+    key_file:  "zeus.key" # Path to TLS private key
+    auto_gen:  true       # If true, Zeus generates a self-signed cert on startup
+
+# ── Persistence ────────────────────────────────────────────
+persistence:
+  enabled: false           # Set true to persist cache + queue state to disk
+  db_path: "zeus.db"       # Path to the SQLite database file
+  sync_interval_sec: 5     # How often (seconds) to flush memory → SQLite
+  load_on_startup: true    # Restore cache/queue data from SQLite on boot
+
+# ── Channels (Pub/Sub) ─────────────────────────────────────
+# Channels let clients subscribe and receive realtime push messages.
+# Any client can PUBLISH to a channel; all subscribers receive it.
+channels:
+  enabled: true
+  max_channels: 500        # Maximum number of named channels
+  max_subscribers: 200     # Max subscribers per channel
+  history_size: 50         # How many past messages to replay on subscribe
+
+# ── Queues (Reliable Command Delivery) ────────────────────
+# Queues are like channels but for commands. One publisher, one consumer.
+# Consumer must ACK each message; unACKed messages are retried.
+queues:
+  enabled: true
+  max_queues: 200
+  max_queue_depth: 10000   # Max unprocessed messages per queue
+  retry:
+    max_attempts: 5        # Give up after this many failures
+    initial_delay_sec: 1   # First retry after 1 second
+    backoff_factor: 2.0    # Multiply delay by this each retry (exponential)
+    max_delay_sec: 60      # Cap retry delay at 60 seconds
+  ack_timeout_sec: 30      # If consumer doesn't ACK within this time → retry
+
+# ── Chat ───────────────────────────────────────────────────
+# First-class chat rooms built on top of channels.
+# Supports: presence (online users), message history, user IDs.
+# All sub-features below are OPTIONAL — plain mode is just fast pub/sub chat.
+chat:
+  enabled: true
+  max_rooms: 100
+  max_members_per_room: 500
+  history_size: 200        # Messages to keep in memory per room
+  presence_ttl_sec: 60     # Mark user offline after this many seconds of silence
+
+  # ── Optional WhatsApp-style features (all off by default) ──
+  features:
+    # receipt_tracking: sent/delivered/read ticks (like WhatsApp grey/blue ticks).
+    # When true, Zeus writes a receipt row per-message per-user in SQLite.
+    # Requires persistence.enabled = true.
+    receipt_tracking: false
+
+    # smart_delivery: on reconnect, push only messages the user hasn't received yet.
+    # Without this, Zeus replays the last history_size messages.
+    # Requires receipt_tracking = true.
+    smart_delivery: false
+
+    # polls: let clients attach polls to messages (multiple choice Q&A).
+    # Clients send OP_CHAT_POLL_VOTE; Zeus stores votes in SQLite.
+    # Requires persistence.enabled = true.
+    polls: false
+
+    # user_metadata: clients can attach arbitrary JSON to their room presence
+    # (display name, avatar URL, role, custom status, etc.).
+    # This metadata is broadcast with presence updates.
+    user_metadata: false
+
+    # gc_after_days: auto-delete messages that ALL members have read after N days.
+    # 0 = disabled. This is the smart GC — Zeus never deletes unread messages.
+    # Requires receipt_tracking = true.
+    gc_after_days: 0
+
+# ── Logging ────────────────────────────────────────────────
+log:
+  level: "info"            # debug | info | warn | error
+  format: "text"           # text | json
+  file: ""                 # Leave blank to log to stdout only
