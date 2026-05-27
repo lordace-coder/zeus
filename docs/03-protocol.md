@@ -243,6 +243,35 @@ Response body: 8-byte poll message ID.
 
 ---
 
+### RPC (Remote Procedure Call)
+
+RPC lets a caller send a task to a worker group and await the result.
+See [11-rpc.md](11-rpc.md) for the full guide.
+
+**Client → Server:**
+
+| Hex | Name | Key | Body |
+|---|---|---|---|
+| `0x60` | `OP_RPC_CALL` | group name | `[timeoutMs:4][payload]` |
+| `0x61` | `OP_RPC_REPLY` | callID | `[isError:1][result bytes]` |
+| `0x62` | `OP_RPC_PROGRESS` | callID | `[pct:1][message string]` |
+| `0x63` | `OP_RPC_CANCEL` | callID | _(empty)_ |
+| `0x64` | `OP_RPC_STATUS` | callID | _(empty)_ |
+| `0x65` | `OP_RPC_CONSUME` | group name | _(empty)_ |
+
+`OP_RPC_CALL` response body: callID string (UTF-8). **Save this** — you need it to track the call if you disconnect.
+
+**Server push → Client:**
+
+| Hex | Name | Body |
+|---|---|---|
+| `0x55` | `OP_PUSH_RPC` | `[callIDLen:1][callID][payload]` — deliver a call to a worker |
+| `0x56` | `OP_PUSH_RPC_RESULT` | `[callIDLen:1][callID][result bytes]` — call succeeded |
+| `0x57` | `OP_PUSH_RPC_PROGRESS` | `[callIDLen:1][callID][pct:1][message]` — progress update |
+| `0x58` | `OP_PUSH_RPC_ERROR` | `[callIDLen:1][callID][error message]` — call failed/timed out |
+
+---
+
 ### Server push frames
 
 Zeus sends these **without** a corresponding client request. Your client
@@ -255,6 +284,10 @@ should always be ready to receive them after joining a room/channel/queue.
 | `0x52` | `OP_PUSH_CHAT` | New message in a room you joined | `[senderLen:1][sender][msgID:8][payload]` |
 | `0x53` | `OP_PUSH_RECEIPT` | Someone delivered/read a message you sent | `[msgID:8][state:1][userIDLen:1][userID]` |
 | `0x54` | `OP_PUSH_PRESENCE` | A room member's metadata changed | JSON `{user_id, meta}` |
+| `0x55` | `OP_PUSH_RPC` | A call has been dispatched to this worker | `[callIDLen:1][callID][payload]` |
+| `0x56` | `OP_PUSH_RPC_RESULT` | An RPC call you made completed successfully | `[callIDLen:1][callID][result]` |
+| `0x57` | `OP_PUSH_RPC_PROGRESS` | Progress update from an RPC worker | `[callIDLen:1][callID][pct:1][message]` |
+| `0x58` | `OP_PUSH_RPC_ERROR` | An RPC call failed or timed out | `[callIDLen:1][callID][error message]` |
 
 **Receipt states (in OP_PUSH_RECEIPT):**
 ```
@@ -289,9 +322,17 @@ your presence in all joined chat rooms.
     □ Parse KeyLen (bytes 8–9) and BodyLen (bytes 10–13)
     □ Read KeyLen + BodyLen more bytes
     □ Dispatch on OpCode:
-        □ OP_RESPONSE  → match RequestID, resolve pending request
-        □ OP_ERROR     → match RequestID, surface error
-        □ OP_PONG      → keepalive confirmed
-        □ OP_PUSH_*    → handle realtime push (channel / queue / chat)
+        □ OP_RESPONSE         → match RequestID, resolve pending request
+        □ OP_ERROR            → match RequestID, surface error
+        □ OP_PONG             → keepalive confirmed
+        □ OP_PUSH_CHANNEL     → channel message for a subscribed topic
+        □ OP_PUSH_QUEUE       → queue item delivered to this consumer
+        □ OP_PUSH_CHAT        → chat message in a joined room
+        □ OP_PUSH_RECEIPT     → delivery receipt update
+        □ OP_PUSH_PRESENCE    → room member metadata change
+        □ OP_PUSH_RPC         → an RPC call dispatched to this worker
+        □ OP_PUSH_RPC_RESULT  → RPC call you made completed
+        □ OP_PUSH_RPC_PROGRESS→ progress update from an RPC worker
+        □ OP_PUSH_RPC_ERROR   → RPC call failed or timed out
 □ Send OP_PING every 20 seconds
 ```

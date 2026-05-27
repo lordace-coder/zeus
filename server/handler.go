@@ -39,6 +39,7 @@ import (
 	"zeus/protocol"
 	"zeus/pubsub"
 	"zeus/queue"
+	"zeus/rpc"
 	"zeus/security"
 	"zeus/store"
 )
@@ -54,6 +55,7 @@ type Server struct {
 	channels *pubsub.Manager
 	queues   *queue.Manager
 	chat     *chat.Manager
+	rpc      *rpc.Manager     // RPC call router
 
 	connCount int64 // atomic counter for active connections
 	mu        sync.RWMutex
@@ -70,6 +72,7 @@ func New(
 	channels *pubsub.Manager,
 	queues *queue.Manager,
 	chatMgr *chat.Manager,
+	rpcMgr *rpc.Manager,
 ) *Server {
 	return &Server{
 		cfg:      cfg,
@@ -79,6 +82,7 @@ func New(
 		channels: channels,
 		queues:   queues,
 		chat:     chatMgr,
+		rpc:      rpcMgr,
 		clients:  make(map[string]*Client),
 	}
 }
@@ -153,6 +157,14 @@ type Client struct {
 	// Track which chat rooms this client is in (for cleanup)
 	chatRooms map[string]bool
 
+	// rpcSend is the channel used by the RPC manager to push live events
+	// (results, progress, errors) to this client's write loop.
+	// Each item is an [op byte, payload []byte] pair encoded as rpc.CallEvent.
+	rpcSend chan rpc.CallEvent
+
+	// rpcWorkerGroups tracks which RPC groups this client is a worker for
+	rpcWorkerGroups map[string]*rpc.Worker
+
 	stopOnce sync.Once
 	stopCh   chan struct{}
 
@@ -162,21 +174,24 @@ type Client struct {
 func newClient(conn net.Conn, srv *Server) *Client {
 	id := atomic.AddUint64(&clientIDCounter, 1)
 	return &Client{
-		id:         fmt.Sprintf("c%d", id),
-		conn:       conn,
-		server:     srv,
-		send:       make(chan *protocol.Frame, 512),
-		chanSubs:   make(map[string]*pubsub.Subscriber),
-		queueConss: make(map[string]*queue.Consumer),
-		chatRooms:  make(map[string]bool),
-		stopCh:     make(chan struct{}),
-		writer:     bufio.NewWriterSize(conn, 32*1024), // 32 KB write buffer
+		id:              fmt.Sprintf("c%d", id),
+		conn:            conn,
+		server:          srv,
+		send:            make(chan *protocol.Frame, 512),
+		chanSubs:        make(map[string]*pubsub.Subscriber),
+		queueConss:      make(map[string]*queue.Consumer),
+		chatRooms:       make(map[string]bool),
+		rpcSend:         make(chan rpc.CallEvent, 256),
+		rpcWorkerGroups: make(map[string]*rpc.Worker),
+		stopCh:          make(chan struct{}),
+		writer:          bufio.NewWriterSize(conn, 32*1024),
 	}
 }
 
 // run starts the reader and writer goroutines and waits for the connection to end.
 func (c *Client) run() {
 	go c.writeLoop()
+	go c.rpcEventLoop() // drains rpcSend → sends RPC push frames to TCP
 
 	// Set initial read deadline for the auth frame
 	c.conn.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -323,6 +338,20 @@ func (c *Client) dispatch(f *protocol.Frame) error {
 		return c.handleChatSetMeta(f)
 	case protocol.OP_CHAT_GET_META:
 		return c.handleChatGetMeta(f)
+
+	// ── RPC ───────────────────────────────────────────────────
+	case protocol.OP_RPC_CONSUME:
+		return c.handleRPCConsume(f)
+	case protocol.OP_RPC_CALL:
+		return c.handleRPCCall(f)
+	case protocol.OP_RPC_REPLY:
+		return c.handleRPCReply(f)
+	case protocol.OP_RPC_PROGRESS:
+		return c.handleRPCProgress(f)
+	case protocol.OP_RPC_CANCEL:
+		return c.handleRPCCancel(f)
+	case protocol.OP_RPC_STATUS:
+		return c.handleRPCStatus(f)
 
 	default:
 		c.pushFrame(protocol.ErrorResponse(f.RequestID, protocol.STATUS_UNKNOWN_OP,
@@ -804,6 +833,18 @@ func (c *Client) cleanup() {
 
 	// Leave all chat rooms
 	c.server.chat.LeaveAll(c.id, c.userID)
+
+	// RPC cleanup:
+	//  - RemoveWorker: any in-progress calls assigned to us go back to pending
+	//    (another worker will pick them up)
+	//  - DisconnectCaller: detaches our live send channel from any calls we
+	//    initiated; the calls remain alive and the caller can reconnect with
+	//    OP_RPC_STATUS to resume tracking
+	c.server.rpc.RemoveWorker(c.id)
+	c.server.rpc.DisconnectCaller(c.id)
+
+	// Close the rpcSend channel so rpcEventLoop exits cleanly
+	close(c.rpcSend)
 }
 
 // ── Internal helpers ─────────────────────────────────────────
@@ -1326,3 +1367,211 @@ func (c *Client) smartDeliveryCatchUp(room string) []byte {
 	b, _ := json.Marshal(entries)
 	return b
 }
+
+// ── RPC handlers ──────────────────────────────────────────────
+//
+// RPC lets a caller send a task to a named worker group and await the result.
+// The key design goal is disconnect-safety: callers can reconnect and resume
+// tracking a call using OP_RPC_STATUS + the callID they received on initiation.
+//
+// Call lifecycle:
+//   pending → in_progress → done | failed | cancelled | timed_out
+//
+// Worker lifecycle:
+//   OP_RPC_CONSUME  → worker registers; Zeus starts delivering calls
+//   worker disconnect → in-progress call re-queued to pending
+
+// rpcEventLoop drains the rpcSend channel and turns each event into a TCP push.
+// This runs as a separate goroutine so RPC pushes never block the main writeLoop.
+func (c *Client) rpcEventLoop() {
+	defer c.stop()
+	for {
+		select {
+		case evt, ok := <-c.rpcSend:
+			if !ok {
+				return
+			}
+			c.pushFrame(&protocol.Frame{
+				Op:   protocol.OpCode(evt.Op),
+				Body: evt.Payload,
+			})
+		case <-c.stopCh:
+			return
+		}
+	}
+}
+
+// handleRPCConsume registers the client as a worker for a named group.
+// Key = group name. After this call Zeus will deliver OP_PUSH_RPC frames
+// to this client when callers submit work to the group.
+//
+// A single client can be a worker for multiple groups (call multiple times).
+func (c *Client) handleRPCConsume(f *protocol.Frame) error {
+	group := f.KeyString()
+	if group == "" {
+		c.pushFrame(protocol.ErrorResponse(f.RequestID, protocol.STATUS_INTERNAL, "group name required"))
+		return nil
+	}
+	if _, already := c.rpcWorkerGroups[group]; already {
+		c.pushFrame(protocol.OKResponse(f.RequestID, nil)) // idempotent
+		return nil
+	}
+
+	// Build a Worker struct with its own delivery channel, register it, then
+	// start a goroutine that turns Call deliveries into OP_PUSH_RPC frames.
+	worker := rpc.NewWorker(c.id)
+	c.server.rpc.AddWorker(group, worker)
+	c.rpcWorkerGroups[group] = worker
+
+	// Goroutine: forward calls delivered to this worker → OP_PUSH_RPC push frames
+	go func() {
+		for call := range worker.Deliver {
+			body := rpc.BuildWorkerDeliveryBody(call.ID, call.Payload)
+			c.pushFrame(&protocol.Frame{Op: protocol.OP_PUSH_RPC, Body: body})
+		}
+	}()
+
+	c.pushFrame(protocol.OKResponse(f.RequestID, nil))
+	return nil
+}
+
+// handleRPCCall initiates a new RPC call.
+// Key  = group name (which worker pool to route to)
+// Body = [timeoutMs:4][payload...]
+//
+// On success the response body is the callID (UTF-8 string) that the caller
+// must save. The caller will receive OP_PUSH_RPC_RESULT (or OP_PUSH_RPC_ERROR)
+// asynchronously when the worker finishes.
+func (c *Client) handleRPCCall(f *protocol.Frame) error {
+	group := f.KeyString()
+	if group == "" {
+		c.pushFrame(protocol.ErrorResponse(f.RequestID, protocol.STATUS_INTERNAL, "group name required"))
+		return nil
+	}
+	if len(f.Body) < 4 {
+		c.pushFrame(protocol.ErrorResponse(f.RequestID, protocol.STATUS_INTERNAL,
+			"body must be [timeoutMs:4][payload...]"))
+		return nil
+	}
+
+	timeout, payload := rpc.ParseTimeoutMs(f.Body)
+	call := c.server.rpc.NewCall(group, payload, timeout, c.id, c.rpcSend)
+
+	// Return the callID to the caller — they must save this!
+	c.pushFrame(protocol.OKResponse(f.RequestID, []byte(call.ID)))
+	return nil
+}
+
+// handleRPCReply is called by a worker to deliver the result of a call.
+// Key  = callID
+// Body = result bytes (arbitrary; caller receives them verbatim)
+func (c *Client) handleRPCReply(f *protocol.Frame) error {
+	callID := f.KeyString()
+	if callID == "" {
+		c.pushFrame(protocol.ErrorResponse(f.RequestID, protocol.STATUS_INTERNAL, "callID required in key"))
+		return nil
+	}
+	// Body format: [isError:1][result bytes]
+	// isError byte 0x01 = worker reports failure, 0x00 = success
+	var isError bool
+	result := f.Body
+	if len(f.Body) >= 1 {
+		isError = f.Body[0] == 0x01
+		result = f.Body[1:]
+	}
+	if err := c.server.rpc.Reply(callID, result, isError); err != nil {
+		c.pushFrame(protocol.ErrorResponse(f.RequestID, protocol.STATUS_NOT_FOUND, err.Error()))
+		return nil
+	}
+	c.pushFrame(protocol.OKResponse(f.RequestID, nil))
+	return nil
+}
+
+// handleRPCProgress is called by a worker to report incremental progress.
+// Key  = callID
+// Body = [percent:1][message string...]
+//   percent — 0–100
+//   message — human-readable status (e.g. "compiling step 3/10")
+//
+// Progress events are stored in the call so reconnecting callers catch up.
+func (c *Client) handleRPCProgress(f *protocol.Frame) error {
+	callID := f.KeyString()
+	if callID == "" {
+		c.pushFrame(protocol.ErrorResponse(f.RequestID, protocol.STATUS_INTERNAL, "callID required in key"))
+		return nil
+	}
+	if len(f.Body) < 1 {
+		c.pushFrame(protocol.ErrorResponse(f.RequestID, protocol.STATUS_INTERNAL,
+			"body must be [percent:1][message...]"))
+		return nil
+	}
+	// Body = [pct:1][message...] — callID comes from the Key field, not the body
+	pct := f.Body[0]
+	msg := string(f.Body[1:])
+	if err := c.server.rpc.Progress(callID, pct, msg); err != nil {
+		c.pushFrame(protocol.ErrorResponse(f.RequestID, protocol.STATUS_NOT_FOUND, err.Error()))
+		return nil
+	}
+	c.pushFrame(protocol.OKResponse(f.RequestID, nil))
+	return nil
+}
+
+// handleRPCCancel cancels an in-flight call.
+// Key = callID
+// The worker receives no further messages; the call transitions to "cancelled".
+// If the call is already done/failed, this is a no-op and returns OK.
+func (c *Client) handleRPCCancel(f *protocol.Frame) error {
+	callID := f.KeyString()
+	if callID == "" {
+		c.pushFrame(protocol.ErrorResponse(f.RequestID, protocol.STATUS_INTERNAL, "callID required in key"))
+		return nil
+	}
+	if err := c.server.rpc.Cancel(callID); err != nil {
+		c.pushFrame(protocol.ErrorResponse(f.RequestID, protocol.STATUS_NOT_FOUND, err.Error()))
+		return nil
+	}
+	c.pushFrame(protocol.OKResponse(f.RequestID, nil))
+	return nil
+}
+
+// handleRPCStatus allows a reconnected caller to query the current state of a call.
+// Key = callID
+//
+// Response body: JSON snapshot containing:
+//   {
+//     "state":    "pending|in_progress|done|failed|cancelled|timed_out",
+//     "result":   <base64 bytes, if done>,
+//     "error":    <string, if failed>,
+//     "progress": [{"pct":N,"msg":"...","ts":unix}, ...],
+//     "created_at": unix,
+//     "updated_at": unix
+//   }
+//
+// This is the disconnect-safe recovery path. A caller that dropped before
+// receiving the result can reconnect and call OP_RPC_STATUS to get the
+// full picture including all progress updates so far.
+func (c *Client) handleRPCStatus(f *protocol.Frame) error {
+	callID := f.KeyString()
+	if callID == "" {
+		c.pushFrame(protocol.ErrorResponse(f.RequestID, protocol.STATUS_INTERNAL, "callID required in key"))
+		return nil
+	}
+	call, ok := c.server.rpc.Get(callID)
+	if !ok {
+		c.pushFrame(protocol.ErrorResponse(f.RequestID, protocol.STATUS_NOT_FOUND,
+			fmt.Sprintf("call %s not found", callID)))
+		return nil
+	}
+
+	// Re-register the caller's live channel so future events are delivered again.
+	// If the call is already terminal (done/failed/etc) this is harmless.
+	c.server.rpc.ReconnectCaller(callID, c.id, c.rpcSend)
+
+	snap := call.StatusSnapshot()
+	c.pushFrame(protocol.OKResponse(f.RequestID, snap))
+	return nil
+}
+
+// cleanup is extended to remove this client from all RPC roles:
+//   - Deregister all worker groups (in-progress calls are re-queued)
+//   - Disconnect as caller (live channel detached; state preserved for reconnect)

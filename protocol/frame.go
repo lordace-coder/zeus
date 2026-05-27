@@ -114,6 +114,36 @@ const (
 	OP_PUSH_RECEIPT  OpCode = 0x53 // Server pushing a receipt update to message sender
 	OP_PUSH_PRESENCE OpCode = 0x54 // Server pushing a presence change to room members
 
+	// ── RPC server → client push ──────────────────────
+	OP_PUSH_RPC          OpCode = 0x55 // Server → worker: deliver a call to handle
+	OP_PUSH_RPC_RESULT   OpCode = 0x56 // Server → caller: call completed with result
+	OP_PUSH_RPC_PROGRESS OpCode = 0x57 // Server → caller: progress update from worker
+	OP_PUSH_RPC_ERROR    OpCode = 0x58 // Server → caller: call failed or timed out
+
+	// ── RPC (Remote Procedure Call) ───────────────────
+	// RPC lets a caller send a task and await a result from a remote worker.
+	// Unlike queues (fire-and-forget) the caller blocks until the worker replies.
+	// Unlike channels (broadcast) exactly ONE worker handles each call.
+	//
+	// Flow:
+	//   Caller → OP_RPC_CALL     key="group"  body=[timeoutMs:4][payload]
+	//   Worker ← OP_PUSH_RPC     key="group"  body=[callIDLen:1][callID][payload]
+	//   Worker → OP_RPC_REPLY    key=callID   body=result bytes
+	//   Caller ← OP_PUSH_RPC_RESULT           body=result bytes
+	//
+	// Progress (for long-running tasks like builds):
+	//   Worker → OP_RPC_PROGRESS key=callID   body=[pct:1][message string]
+	//   Caller ← OP_PUSH_RPC_PROGRESS         body=[pct:1][message string]
+	//
+	// Disconnect-safe: if the caller disconnects, the call stays alive on the
+	// server. Reconnect and send OP_RPC_STATUS key=callID to get current state.
+	OP_RPC_CALL     OpCode = 0x60 // Caller: initiate a call; key=group, body=[timeoutMs:4][payload]
+	OP_RPC_REPLY    OpCode = 0x61 // Worker: send result; key=callID, body=result
+	OP_RPC_PROGRESS OpCode = 0x62 // Worker: report progress; key=callID, body=[pct:1][message]
+	OP_RPC_CANCEL   OpCode = 0x63 // Caller: cancel a call; key=callID
+	OP_RPC_STATUS   OpCode = 0x64 // Caller: poll call status after reconnect; key=callID
+	OP_RPC_CONSUME  OpCode = 0x65 // Worker: register as handler for a group; key=group
+
 	// ── Responses ─────────────────────────────────────
 	OP_RESPONSE OpCode = 0xF0 // Successful response
 	OP_ERROR    OpCode = 0xFF // Error response

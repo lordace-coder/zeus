@@ -49,6 +49,7 @@ import (
 	"zeus/config"
 	"zeus/pubsub"
 	"zeus/queue"
+	"zeus/rpc"
 	"zeus/security"
 	"zeus/server"
 	"zeus/store"
@@ -82,7 +83,7 @@ func main() {
 	// On first run, show the generated token prominently so the operator
 	// can copy it to their clients immediately.
 	if firstRun {
-		printFirstRunBanner(cfg, configPath)
+		cmd.PrintStartupBanner(cfg.Addr(), cfg.Security.Token, cfg.Security.Enabled, cfg.Security.TLS.Enabled)
 	}
 
 	// ── Setup logger ─────────────────────────────────────────
@@ -255,8 +256,13 @@ func main() {
 		log.Printf("[zeus] chat GC enabled: delete read messages after %d days", gcDays)
 	}
 
+	// ── RPC manager ──────────────────────────────────────────────────────────
+	// Default call timeout is 5 minutes; callers can override per-call via
+	// the [timeoutMs:4] prefix in OP_RPC_CALL body.
+	rpcMgr := rpc.NewManager(5 * time.Minute)
+
 	// ── Server ───────────────────────────────────────────────
-	srv := server.New(cfg, auth, cache, db, channels, queues, chatMgr)
+	srv := server.New(cfg, auth, cache, db, channels, queues, chatMgr, rpcMgr)
 
 	// ── TCP listener ─────────────────────────────────────────
 	var listener net.Listener
@@ -270,12 +276,9 @@ func main() {
 	}
 	defer listener.Close()
 
+	// Print the animated ASCII banner with thunder effect
+	cmd.PrintStartupBanner(cfg.Addr(), cfg.Security.Token, cfg.Security.Enabled, cfg.Security.TLS.Enabled)
 	log.Printf("[zeus] ready — listening on %s", cfg.Addr())
-	if cfg.Security.Enabled {
-		log.Printf("[zeus] auth token: %s", cfg.Security.Token)
-	} else {
-		log.Printf("[zeus] ⚠  security is disabled — any client can connect")
-	}
 
 	// ── Graceful shutdown ─────────────────────────────────────
 	// Listen for SIGINT / SIGTERM so we can flush writes before exiting.
@@ -312,25 +315,6 @@ func main() {
 }
 
 // ── Helpers ───────────────────────────────────────────────────
-
-func printFirstRunBanner(cfg *config.Config, configPath string) {
-	fmt.Println()
-	fmt.Println("  ╔══════════════════════════════════════════════════╗")
-	fmt.Println("  ║          Zeus — First Run Setup Complete!        ║")
-	fmt.Println("  ╚══════════════════════════════════════════════════╝")
-	fmt.Println()
-	fmt.Printf("  Config: %s\n", configPath)
-	fmt.Println()
-	fmt.Println("  ┌─ Auth Token (copy to all your clients) ──────────")
-	fmt.Printf("  │  %s\n", cfg.Security.Token)
-	fmt.Println("  └──────────────────────────────────────────────────")
-	fmt.Println()
-	fmt.Println("  Edit zeus.yaml to:")
-	fmt.Println("   • Enable persistence  (persistence.enabled: true)")
-	fmt.Println("   • Enable TLS          (security.tls.enabled: true)")
-	fmt.Println("   • Set webhook URL     (webhook.enabled: true, webhook.url: ...)")
-	fmt.Println()
-}
 
 // setupLogger configures the standard logger with appropriate flags.
 func setupLogger(level, file string) {

@@ -2,7 +2,7 @@
 
 ## What is Zeus?
 
-Zeus is a **high-performance binary-protocol server** that handles four things
+Zeus is a **high-performance binary-protocol server** that handles five things
 that are genuinely hard to build yourself:
 
 | Feature | What it does |
@@ -11,6 +11,7 @@ that are genuinely hard to build yourself:
 | **Channels** | Realtime pub/sub fan-out to thousands of subscribers |
 | **Queues** | Reliable command delivery with ACK, retry, and failure tracking |
 | **Chat** | Full chat room system with presence, history, polls, and delivery receipts |
+| **RPC** | Send a task to a remote worker and await the result — disconnect-safe |
 
 You connect to Zeus over a plain TCP socket (or TLS) and speak its binary
 frame protocol. Zeus is **not HTTP** — it is a persistent connection server,
@@ -84,6 +85,13 @@ layer you can swap out without losing anything.
 │  Optional: smart GC (delete only fully-read old messages)    │
 │  Webhooks → your backend on every event                      │
 ├──────────────────────────────────────────────────────────────┤
+├──────────────────────────────────────────────────────────────┤
+│  RPC  (Remote Procedure Call)                                │
+│  Send a task → worker executes → result returned to caller   │
+│  Disconnect-safe: reconnect + poll callID for result         │
+│  Progress streaming: worker reports 0–100% as it works      │
+│  Round-robin worker dispatch  •  per-call timeout           │
+├──────────────────────────────────────────────────────────────┤
 │  SECURITY                                                    │
 │  Token auth (auto-generated)  •  Optional TLS (auto cert)   │
 │  HMAC-SHA256 webhook signatures                              │
@@ -137,6 +145,27 @@ dead-letter storage, and round-robin delivery to multiple workers.
 
 > Examples: email sending, image resizing, payment webhooks, report
 > generation, SMS dispatch
+
+---
+
+### 🔁 Remote procedure calls (RPC) — task delegation with results
+
+You need to delegate a computation to a remote device or worker and
+**get the result back**. Queues deliver but don't reply. Channels broadcast
+but don't route. RPC does exactly one thing: send a task, await the result.
+
+Think: a server asking a client device to build a Flutter APK and returning
+the binary, or offloading a GPU computation to a worker machine.
+
+**Zeus gives you:**
+- One caller → one worker (not broadcast — exactly the right machine handles it)
+- Async result delivery — caller awaits `OP_PUSH_RPC_RESULT` over the same connection
+- **Disconnect-safe** — if the caller drops mid-task, the worker keeps running; reconnect and call `OP_RPC_STATUS` with your callID to get the result
+- **Progress streaming** — worker sends 0–100% updates, all stored for catch-up
+- Round-robin worker pools — multiple workers share the load
+
+> Examples: remote builds (Flutter, Webpack, Docker), GPU inference,
+> video transcoding, remote code execution, distributed computation
 
 ---
 
@@ -200,3 +229,4 @@ process.
 | **08-security.md** | Token auth, TLS, webhook signatures |
 | **09-config-reference.md** | Every zeus.yaml field explained |
 | **10-project-structure.md** | Codebase layout, what each file does |
+| **11-rpc.md** | RPC system — remote calls, progress, disconnect-safety |
